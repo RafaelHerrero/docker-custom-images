@@ -1,0 +1,219 @@
+name: Build and Push Images
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'src/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has-changes: ${{ steps.set-matrix.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Detect changed images
+        id: set-matrix
+        run: |
+          set -e
+          
+          # Determine comparison range based on event type
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "Detecting changes in PR (comparing against base branch)"
+            git fetch origin ${{ github.base_ref }}
+            CHANGED_DIRS=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep '^src/' | cut -d'/' -f2 | sort -u || true)
+          else
+            echo "Detecting changes in push to main"
+            # For first commit on branch, compare against empty tree
+            if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+              CHANGED_DIRS=$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }} | grep '^src/' | cut -d'/' -f2 | sort -u || true)
+            else
+              CHANGED_DIRS=$(git diff --name-only ${{ github.event.before }}..${{ github.sha }} | grep '^src/' | cut -d'/' -f2 | sort -u || true)
+            fi
+          fi
+          
+          # Debug output
+          echo "Changed directories in src/:"
+          echo "$CHANGED_DIRS"
+          
+          # Convert to JSON array
+          if [ -z "$CHANGED_DIRS" ]; then
+            echo "No changes detected in src/"
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          else
+            # Filter only directories that contain a Dockerfile
+            VALID_DIRS=""
+            for dir in $CHANGED_DIRS; do
+              if [ -f "src/$dir/Dockerfile" ]; then
+                VALID_DIRS="$VALID_DIRS $dir"
+              else
+                echo "Warning: src/$dir has changes but no Dockerfile found, skipping"
+              fi
+            done
+            
+            if [ -z "$VALID_DIRS" ]; then
+              echo "No valid image directories with Dockerfile found"
+              echo "matrix=[]" >> $GITHUB_OUTPUT
+              echo "has-changes=false" >> $GITHUB_OUTPUT
+            else
+              # Convert to JSON array format
+              MATRIX_JSON=$(echo "$VALID_DIRS" | tr ' ' '\n' | grep -v '^$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+              echo "Matrix JSON: $MATRIX_JSON"
+              echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+              echo "has-changes=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  build-and-push:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      image-tags: ${{ steps.collect-tags.outputs.tags }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: docker/setup-buildx-action@v3
+      
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/docker-custom-images/${{ matrix.image }}
+          tags: |
+            type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./src/${{ matrix.image }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+      
+      - name: Collect image tags
+        id: collect-tags
+        run: |
+          echo "Image: ${{ matrix.image }}" >> $GITHUB_STEP_SUMMARY
+          echo "Tags:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+  comment-deployment:
+    needs: [detect-changes, build-and-push]
+    if: always() && needs.detect-changes.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create deployment comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const images = ${{ needs.detect-changes.outputs.matrix }};
+            const isPR = context.eventName === 'pull_request';
+            const isMain = context.ref === 'refs/heads/main';
+            
+            // Build the comment body
+            let commentBody = '## Docker Images Deployed\n\n';
+            
+            if (isPR) {
+              commentBody += `### PR Build Tags\n\n`;
+              commentBody += `These images were built and pushed for testing:\n\n`;
+            } else if (isMain) {
+              commentBody += `### Production Release Tags\n\n`;
+              commentBody += `These images were built and pushed to production:\n\n`;
+            }
+            
+            const owner = context.repo.owner.toLowerCase();
+            const sha = context.sha.substring(0, 7);
+            
+            for (const image of images) {
+              const baseImage = `ghcr.io/${owner}/docker-custom-images/${image}`;
+              commentBody += `#### \`${image}\`\n\n`;
+              
+              if (isPR) {
+                const prNumber = context.payload.pull_request.number;
+                commentBody += `- \`${baseImage}:pr-${prNumber}\`\n`;
+                commentBody += `- \`${baseImage}:sha-${sha}\`\n\n`;
+                commentBody += `**Pull command:**\n`;
+                commentBody += `\`\`\`bash\n`;
+                commentBody += `docker pull ${baseImage}:pr-${prNumber}\n`;
+                commentBody += `\`\`\`\n\n`;
+              } else if (isMain) {
+                commentBody += `- \`${baseImage}:latest\`\n`;
+                commentBody += `- \`${baseImage}:sha-${sha}\`\n\n`;
+                commentBody += `**Pull command:**\n`;
+                commentBody += `\`\`\`bash\n`;
+                commentBody += `docker pull ${baseImage}:latest\n`;
+                commentBody += `\`\`\`\n\n`;
+              }
+            }
+            
+            commentBody += `\n---\n`;
+            commentBody += `**Workflow:** [${context.workflow} #${context.runNumber}](${context.payload.repository.html_url}/actions/runs/${context.runId})\n`;
+            commentBody += `**Commit:** ${sha}\n`;
+            
+            // Post comment based on context
+            if (isPR) {
+              // Comment on PR
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: commentBody
+              });
+            } else if (isMain) {
+              // Find associated PR and comment there
+              const commit = await github.rest.repos.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.sha
+              });
+              
+              // Try to find PR from commit message or associated PRs
+              const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha
+              });
+              
+              if (prs.data.length > 0) {
+                // Comment on the merged PR
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prs.data[0].number,
+                  body: commentBody
+                });
+              }
+            }
+
